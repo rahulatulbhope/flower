@@ -7,6 +7,242 @@ cluster-aware selection each round.
 
 ---
 
+## Setup
+
+Install the Flower fork in editable mode from its source tree:
+
+```bash
+cd /path/to/flower/framework/py
+pip install -e .
+```
+
+NumPy is the only FLIPS-specific dependency; it is already required by Flower.
+
+---
+
+## Running with Flower
+
+FLIPS plugs directly into Flower's **Strategy API**.  The recommended way to run
+any Flower project is with the `flwr run` CLI, which handles both simulation
+(single machine) and deployment (multi-machine) without touching application
+code.
+
+### 1 — Project layout
+
+Create a new directory (e.g. `my_flips_run/`) with the following three files:
+
+```
+my_flips_run/
+├── pyproject.toml
+├── server_app.py
+└── client_app.py
+```
+
+### 2 — `pyproject.toml`
+
+```toml
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "my-flips-run"
+version = "0.1.0"
+dependencies = ["flwr[simulation]>=1.13.0", "numpy"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["."]
+
+[tool.flwr.app]
+publisher = "you"
+
+[tool.flwr.app.components]
+serverapp = "server_app:app"
+clientapp = "client_app:app"
+
+[tool.flwr.app.config]
+num-server-rounds = 10
+clients-per-round = 5
+num-supernodes = 20
+num-classes = 10
+```
+
+### 3 — `server_app.py`
+
+```python
+from pathlib import Path
+
+import numpy as np
+from flwr.common import Context, ndarrays_to_parameters
+from flwr.server import ServerApp, ServerAppComponents, ServerConfig
+
+from flwr.server.flips.server.aggregation import make_flips_fedavg
+
+
+def server_fn(context: Context) -> ServerAppComponents:
+    cfg = context.run_config
+    num_rounds: int = cfg["num-server-rounds"]
+    clients_per_round: int = cfg["clients-per-round"]
+    num_classes: int = cfg["num-classes"]
+
+    # Dummy initial parameters — replace with your real model weights
+    initial_params = ndarrays_to_parameters(
+        [np.zeros((num_classes, num_classes), dtype=np.float32)]
+    )
+
+    strategy = make_flips_fedavg(
+        clients_per_round=clients_per_round,
+        min_fit_clients=max(1, clients_per_round - 2),
+        min_available_clients=clients_per_round,
+        initial_parameters=initial_params,
+        log_path=Path("flips_metrics.jsonl"),  # remove to disable logging
+        # Optional: auto-select k clusters
+        # clusterer=LabelDistributionClusterer(k=None, k_min=2, k_max=8),
+    )
+
+    return ServerAppComponents(
+        strategy=strategy,
+        config=ServerConfig(num_rounds=num_rounds),
+    )
+
+
+app = ServerApp(server_fn=server_fn)
+```
+
+### 4 — `client_app.py`
+
+```python
+import time
+
+import numpy as np
+from flwr.client import ClientApp, NumPyClient
+from flwr.common import Context, NDArrays
+
+from flwr.server.flips.client.flips_client import FlipsNumPyClient
+
+
+def client_fn(context: Context) -> NumPyClient:
+    partition_id: int = context.node_config["partition-id"]
+    num_partitions: int = context.node_config["num-partitions"]
+    num_classes: int = int(context.run_config["num-classes"])
+
+    # ------------------------------------------------------------------ #
+    # Replace the stubs below with your real dataset / model loading.     #
+    # ------------------------------------------------------------------ #
+    # Simulate non-IID label skew: each partition gets 2 dominant classes
+    dominant = [partition_id % num_classes, (partition_id + 1) % num_classes]
+    rng = np.random.default_rng(partition_id)
+    labels = rng.choice(dominant, size=500).tolist()
+
+    # Toy model: single weight matrix
+    weights = [np.zeros((num_classes, num_classes), dtype=np.float32)]
+
+    def get_parameters() -> NDArrays:
+        return weights
+
+    def set_parameters(params: NDArrays) -> None:
+        weights[:] = params
+
+    def train(config: dict) -> tuple[NDArrays, int, dict]:
+        # Replace with real training loop
+        time.sleep(0.01)
+        return weights, len(labels), {}
+
+    def evaluate(config: dict) -> tuple[float, int, dict]:
+        return 0.0, len(labels), {"accuracy": 0.0}
+
+    return FlipsNumPyClient(
+        get_parameters_fn=get_parameters,
+        set_parameters_fn=set_parameters,
+        train_fn=train,
+        evaluate_fn=evaluate,
+        label_iterable=labels,
+        num_classes=num_classes,
+    ).to_client()
+
+
+app = ClientApp(client_fn=client_fn)
+```
+
+### 5 — Run in simulation mode
+
+```bash
+cd my_flips_run
+flwr run .
+```
+
+Override any config value at the command line without editing files:
+
+```bash
+# Run for 20 rounds with 8 clients per round
+flwr run . --run-config "num-server-rounds=20 clients-per-round=8"
+
+# Scale up to 50 simulated nodes
+flwr run . --run-config "num-supernodes=50 clients-per-round=10"
+```
+
+### 6 — Run in deployment mode
+
+Start the SuperLink (server-side infrastructure):
+
+```bash
+flower-superlink --insecure
+```
+
+Start each SuperNode (one per physical client machine):
+
+```bash
+flower-supernode --insecure --superlink 127.0.0.1:9092
+```
+
+Then dispatch the run from your coordinator:
+
+```bash
+flwr run . --app . --stream
+```
+
+See the [Flower Deployment Engine docs](https://flower.ai/docs/framework/how-to-run-flower-with-deployment-engine.html)
+for TLS, authentication, and Docker setup.
+
+---
+
+## Inspecting FLIPS metrics
+
+When `log_path` is set, FLIPS writes one JSON object per round to
+`flips_metrics.jsonl`.  Read it with standard tools:
+
+```python
+import json, pathlib
+
+records = [
+    json.loads(line)
+    for line in pathlib.Path("flips_metrics.jsonl").read_text().splitlines()
+]
+
+for r in records:
+    print(
+        f"Round {r['server_round']:3d} | "
+        f"clients_selected={r['clients_selected']} | "
+        f"straggler_rate={r['straggler_rate']:.2f} | "
+        f"num_clusters={r['num_clusters']}"
+    )
+```
+
+Available fields per record:
+
+| Field | Type | Description |
+|---|---|---|
+| `server_round` | int | Round number |
+| `clients_selected` | int | Clients sent FitIns |
+| `clients_completed` | int | Clients that returned FitRes |
+| `straggler_rate` | float | EMA straggler rate estimate |
+| `num_clusters` | int | Active cluster count |
+| `cluster_sizes` | list[int] | Members per cluster |
+| `extra_clients` | int | Overprovisioned extras this round |
+| `fit_duration_s` | float | Wall-clock time for this round's fit phase |
+
+---
+
 ## Module layout
 
 ```
@@ -95,32 +331,27 @@ aggregate_fit(round R, results, failures):
 
 ---
 
-## Quick-start
+## API quick-start
 
-### Minimal FedAvg setup
+The three factory functions cover the most common base strategies.  All
+keyword arguments not listed here are forwarded unchanged to the underlying
+strategy constructor.
+
+### FedAvg
 
 ```python
 from flwr.server.flips.server.aggregation import make_flips_fedavg
-from flwr.server.server_config import ServerConfig
-from flwr.server.server_app import ServerApp
 
 strategy = make_flips_fedavg(
     clients_per_round=10,
     min_fit_clients=8,
     min_available_clients=20,
-    initial_parameters=...,   # your model parameters
+    initial_parameters=...,
     log_path=Path("logs/flips.jsonl"),
-)
-
-app = ServerApp(
-    server_fn=lambda ctx: ServerAppComponents(
-        strategy=strategy,
-        server_config=ServerConfig(num_rounds=50),
-    )
 )
 ```
 
-### FedProx with automatic straggler overprovisioning
+### FedProx with straggler overprovisioning
 
 ```python
 from flwr.server.flips.server.aggregation import make_flips_fedprox
@@ -147,7 +378,7 @@ clusterer = LabelDistributionClusterer(k=None, k_min=2, k_max=8, seed=42)
 strategy = make_flips_fedavg(
     clients_per_round=10,
     clusterer=clusterer,
-    ...
+    initial_parameters=...,
 )
 ```
 
@@ -155,16 +386,20 @@ strategy = make_flips_fedavg(
 
 ```python
 from flwr.server.flips.client.flips_client import FlipsNumPyClient
-from flwr.client import ClientApp, NumPyClient
+from flwr.client import ClientApp
 
-client = FlipsNumPyClient(
-    get_parameters_fn=lambda: get_weights(net),
-    set_parameters_fn=lambda p: set_weights(net, p),
-    train_fn=lambda cfg: train(net, trainloader, cfg),
-    evaluate_fn=lambda cfg: test(net, testloader),
-    label_iterable=train_dataset.targets,  # any iterable of labels
-)
-app = ClientApp(client_fn=lambda ctx: client)
+def client_fn(context):
+    client = FlipsNumPyClient(
+        get_parameters_fn=lambda: get_weights(net),
+        set_parameters_fn=lambda p: set_weights(net, p),
+        train_fn=lambda cfg: train(net, trainloader, cfg),
+        evaluate_fn=lambda cfg: test(net, testloader),
+        label_iterable=train_dataset.targets,
+        num_classes=10,
+    )
+    return client.to_client()
+
+app = ClientApp(client_fn=client_fn)
 ```
 
 ---
@@ -207,8 +442,13 @@ expose FLIPS as a first-class Flower namespace or add deep workflow integration.
 ## Running the tests
 
 ```bash
-# Requires Python >= 3.10 and numpy installed
+# From the repo root — requires Python >= 3.10
+cd /path/to/flower
 python3.11 -m pytest framework/py/flwr/server/flips/tests/ -v
+
+# Or from the framework/py/ directory after pip install -e .
+cd framework/py
+python3.11 -m pytest flwr/server/flips/tests/ -v
 ```
 
 Individual test files and what they cover:
